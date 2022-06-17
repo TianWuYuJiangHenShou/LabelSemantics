@@ -1,3 +1,5 @@
+import json
+
 import torch
 import os
 import copy
@@ -22,7 +24,7 @@ from torch.utils.data import TensorDataset, DataLoader, RandomSampler, Sequentia
 from sklearn import metrics
 
 base = './ResumeNER'
-base_path = '/root/berts/chinese-roberta-wwm-ext'
+base_path = '/root/workspace/berts/chinese-roberta-wwm-ext'
 train_path = 'train.char.bmes'
 dev_path = 'dev.char.bmes'
 test_path = 'test.char.bmes'
@@ -44,19 +46,24 @@ def load_data(base,train_path):
             token,label = [],[]
     return tokens,labels
 
-def trans2id(labels):
-    tag_set = set()
-    for line in labels:
-        for label  in line:
-            if label not in tag_set:
-                tag_set.add(label)
-    # tag_set.add('[CLS]')
-    # tag_set.add('[SEP]')
-    tag_set = list(tag_set)
+def trans2id(label_file):
+    with open(label_file,'r') as f:
+        labels = json.load(f)
+
+    #short labels
+    short_labels = labels.keys()
+
+    tag_set = []
+    for line in short_labels:
+        prefix = ['B-','M-','E-','S-']
+        tag_set += [pre+line for pre in prefix]
+    tag_set.append('O')
+
+    tag_set = list(set(tag_set))
     idx = [i for i in range(len(tag_set))]
     tag2id = dict(zip(tag_set,idx))
     id2tag = dict(zip(idx,tag_set))
-    return tag2id,id2tag
+    return tag2id,id2tag,short_labels
 
 def gen_features(tokens,labels,tokenizer,tag2id,max_len):
     tags,input_ids,token_type_ids,attention_masks,lengths = [],[],[],[],[]
@@ -83,30 +90,22 @@ max_len = 128
 bs = 32
 tokenizer = BertTokenizer.from_pretrained(base_path)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+tag_file = 'tags.json'
 
 train_tokens,train_labels = load_data(base,train_path)
-tag2id,id2tag = trans2id(train_labels)
+tag2id,id2tag,short_labels = trans2id(tag_file)
 train_ids,train_token_type_ids,train_attention_masks,train_tags,train_lengths = gen_features(train_tokens,train_labels,tokenizer,tag2id,max_len)
 
 dev_tokens,dev_labels = load_data(base,dev_path)
 dev_ids,dev_token_type_ids,dev_attention_masks,dev_tags,dev_lengths = gen_features(dev_tokens,dev_labels,tokenizer,tag2id,max_len)
 
 class FewShot_NER(nn.Module):
-    def __init__(self,base_model_path,tag2id,batch_size):
+    def __init__(self,base_model_path,tag2id,batch_size,tag_file):
         super().__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.token_encoder = BertModel.from_pretrained(base_model_path).to(self.device)
         self.label_encoder = BertModel.from_pretrained(base_model_path).to(self.device)
-        self.label_context = {
-            "EDU":"学历",
-            "NAME":"姓名",
-            "TITLE":"职称",
-            "CONT":"国籍",
-            "ORG":"组织",
-            "LOC":"地区",
-            "PRO":"产品",
-            "RACE":"种族"
-        }
+        self.label_context = self.__read_file(tag_file)
         self.index_context = {
             "B":"开始词",
             "M":"中间词",
@@ -114,9 +113,13 @@ class FewShot_NER(nn.Module):
             "S":"单字词"
         }
         self.tokenizer = BertTokenizer.from_pretrained(base_path)
-        # self.label_representation = self.build_label_representation(tag2id)
         self.label_representation = self.build_label_representation(tag2id).to(self.device)
         self.batch_size = batch_size
+
+    def __read_file(self,file):
+        with open(file,'r') as f:
+            data = json.load(f)
+        return data
 
     def build_label_representation(self,tag2id):
         labels = []
@@ -132,20 +135,21 @@ class FewShot_NER(nn.Module):
         A.shape =（b,m,n)；B.shape = (b,n,k)
         torch.matmul(A,B) 结果shape为(b,m,k)
         '''
+
+        tag_max_len = max([len(l) for l in labels])
         tag_embeddings = []
         for label in labels:
-            input_ids = tokenizer.encode_plus(label,return_tensors='pt')
+            input_ids = tokenizer.encode_plus(label,return_tensors='pt',padding='max_length',max_length=tag_max_len)
             outputs = self.label_encoder(input_ids=input_ids['input_ids'].to(self.device),
                                          token_type_ids=input_ids['token_type_ids'].to(self.device),attention_mask = input_ids['attention_mask'].to(self.device))
-            last_hidden_states = outputs.last_hidden_state.detach()
+            pooler_output = outputs.pooler_output.detach()
             # print(label_representation.shape,last_hidden_states.shape)
-            tag_embeddings.append(last_hidden_states)
+            tag_embeddings.append(pooler_output)
             # label_representation = torch.cat((label_representation,last_hidden_states),0)
         label_embeddings = torch.stack(tag_embeddings,dim=0)
         label_embeddings = label_embeddings.squeeze(1)
         # print('label_embeddings shape',label_embeddings.shape)
-        label_representation = label_embeddings
-        return label_representation[:,0,:]
+        return label_embeddings
 
     def forward(self,inputs):
         # print(inputs['input_ids'].shape)
@@ -191,7 +195,7 @@ valid_data = TensorDataset(dev_ids, dev_masks,dev_token_type_ids,dev_tags)
 valid_sampler = RandomSampler(valid_data)
 valid_dataloader = DataLoader(valid_data, sampler=valid_sampler, batch_size=bs)
 
-fewshot = FewShot_NER(base_path,tag2id,bs)
+fewshot = FewShot_NER(base_path,tag2id,bs,tag_file)
 
 optimizer = torch.optim.Adam(fewshot.parameters(),
                   lr = 5e-5 # default is 5e-5
@@ -280,7 +284,7 @@ for i in range(epochs):
         input_ids,masks,token_type_ids,labels= (i.to(device) for i in batch)
         matrix_embeddings,label_indexs = fewshot({"input_ids":input_ids,"attention_mask":masks,"token_type_ids":token_type_ids})
         # print(outputs.float().dtype,labels.float().dtype)
-        loss = loss_function(matrix_embeddings.view(-1, 28),labels.view(-1)) # CrossEntropyLoss
+        loss = loss_function(matrix_embeddings.view(-1, len(tag2id)),labels.view(-1)) # CrossEntropyLoss
 
         loss.backward()
 

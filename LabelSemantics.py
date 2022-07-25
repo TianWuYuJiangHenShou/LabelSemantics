@@ -183,9 +183,18 @@ valid_sampler = RandomSampler(valid_data)
 valid_dataloader = DataLoader(valid_data, sampler=valid_sampler, batch_size=bs)
 
 fewshot = FewShot_NER(base_path,tag2id,bs,tag_file)
+```
+根据paper，基本的Pipelines的流程是先在source dataset上pre-finetuning，然后在source dataset上面finetune.
+
+两个步骤的区别就在这下面两行代码。在target dataset上面finetune的时候，只需要加载pre-finetuning训练好的模型作为base model就行了。
+
+pre-finetuning的时候注释掉着两行就好了
+```
+pretrain_path = ''
+fewshot.load_state_dict(torch.load(pretrain_path),strict = True)
 
 optimizer = torch.optim.Adam(fewshot.parameters(),
-                  lr = 5e-5 # default is 5e-5
+                  lr = 1e-5 # default is 5e-5
                   # eps = 1e-8 # default is 1e-8
                 )
 

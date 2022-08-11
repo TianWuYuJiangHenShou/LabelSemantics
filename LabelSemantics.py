@@ -116,6 +116,7 @@ class FewShot_NER(nn.Module):
         #self.label_representation = self.build_label_representation(tag2id).to(self.device)
         self.batch_size = batch_size
         self.tag2id = tag2id
+        self.register_buffer('label_representation',torch.zeros(len(tag2id),768))
 
     def __read_file(self,file):
         with open(file,'r') as f:

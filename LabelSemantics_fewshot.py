@@ -23,11 +23,11 @@ from sklearn.preprocessing import MultiLabelBinarizer
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
 from sklearn import metrics
 
-base = './ResumeNER'
+base = '/root/workspace/FewShotNER/dataset-fewshot/transwarp-finance'
 base_path = '/root/workspace/berts/chinese-roberta-wwm-ext'
-train_path = 'train.char.bmes'
-dev_path = 'dev.char.bmes'
-test_path = 'test.char.bmes'
+train_path = '20-shot-train.txt'
+dev_path = 'test.txt'
+#test_path = 'test.txt'
 
 def load_data(base,train_path):
     full = os.path.join(base,train_path)
@@ -37,9 +37,9 @@ def load_data(base,train_path):
     token,label = [],[]
     for line in data:
         line= line.strip().replace("\n",'')
-        if len(line.split(' ')) == 2:
-            token.append(line.split(' ')[0])
-            label.append(line.split(' ')[1])
+        if len(line.split('\t')) == 2:
+            token.append(line.split('\t')[0])
+            label.append(line.split('\t')[1])
         else:
             tokens.append(token)
             labels.append(label)
@@ -55,7 +55,7 @@ def trans2id(label_file):
 
     tag_set = []
     for line in short_labels:
-        prefix = ['B-','M-','E-','S-']
+        prefix = ['B-','I-']
         tag_set += [pre+line for pre in prefix]
     tag_set.append('O')
 
@@ -87,10 +87,10 @@ def gen_features(tokens,labels,tokenizer,tag2id,max_len):
     return input_ids,token_type_ids,attention_masks,tags,lengths
 
 max_len = 128
-bs = 32
+bs = 16
 tokenizer = BertTokenizer.from_pretrained(base_path)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-tag_file = 'tags.json'
+tag_file = 'fewshot.json'
 
 train_tokens,train_labels = load_data(base,train_path)
 tag2id,id2tag,short_labels = trans2id(tag_file)
@@ -108,13 +108,16 @@ class FewShot_NER(nn.Module):
         self.label_context = self.__read_file(tag_file)
         self.index_context = {
             "B":"开始词",
-            "M":"中间词",
+            "I":"中间词",
             "E":"结束词",
             "S":"单字词"
         }
         self.tokenizer = BertTokenizer.from_pretrained(base_path)
-        self.label_representation = self.build_label_representation(tag2id).to(self.device)
+        #self.label_representation = self.build_label_representation(tag2id).to(self.device)
         self.batch_size = batch_size
+        self.tag2id = tag2id
+        label_representation = torch.zeros(len(tag2id),768)
+        #self.register_buffer('label_representation',label_representation)
 
     def __read_file(self,file):
         with open(file,'r') as f:
@@ -135,45 +138,34 @@ class FewShot_NER(nn.Module):
         A.shape =（b,m,n)；B.shape = (b,n,k)
         torch.matmul(A,B) 结果shape为(b,m,k)
         '''
-
         tag_max_len = max([len(l) for l in labels])
         tag_embeddings = []
         for label in labels:
             input_ids = tokenizer.encode_plus(label,return_tensors='pt',padding='max_length',max_length=tag_max_len)
             outputs = self.label_encoder(input_ids=input_ids['input_ids'].to(self.device),
                                          token_type_ids=input_ids['token_type_ids'].to(self.device),attention_mask = input_ids['attention_mask'].to(self.device))
-            pooler_output = outputs.pooler_output.detach()
-            # print(label_representation.shape,last_hidden_states.shape)
+            pooler_output = outputs.pooler_output
             tag_embeddings.append(pooler_output)
-            # label_representation = torch.cat((label_representation,last_hidden_states),0)
         label_embeddings = torch.stack(tag_embeddings,dim=0)
         label_embeddings = label_embeddings.squeeze(1)
-        # print('label_embeddings shape',label_embeddings.shape)
         return label_embeddings
 
-    def forward(self,inputs):
-        # print(inputs['input_ids'].shape)
+    def forward(self,inputs,flag = True):
+        if flag:
+            label_representation = self.build_label_representation(self.tag2id).to(self.device)
+            self.label_representation = label_representation.detach()
+        else:
+            label_representation = self.label_representation
         outputs = self.token_encoder(input_ids=inputs['input_ids'],
                                      token_type_ids=inputs['token_type_ids'],attention_mask = inputs['attention_mask'])
         token_embeddings = outputs.last_hidden_state
-        # print(token_embeddings.shape,self.label_representation.shape)
-        # print(token_embeddings.device,self.label_representation.device)
         tag_lens,hidden_size = self.label_representation.shape
         current_batch_size  = token_embeddings.shape[0]
         label_embedding = self.label_representation.expand(current_batch_size,tag_lens,hidden_size)
-        # print(label_embedding.device)
         label_embeddings = label_embedding.transpose(2,1)
-        # print(label_embedding.device)
-        # print(token_embeddings.shape,label_embedding.shape)
-        # matrix_embeddings shape torch.Size([bs, max_len, tag_len])
         matrix_embeddings = torch.matmul(token_embeddings,label_embeddings)
-        # print('matrix_embeddings shape',matrix_embeddings.shape,matrix_embeddings.device)
         softmax_embedding= nn.Softmax(dim=-1)(matrix_embeddings)
-        # print(softmax_embedding.device)
         label_indexs = torch.argmax(softmax_embedding,dim=-1)
-        # print(label_indexs.device)
-        #（bs,label_lengths）
-        # print('label_indexs',label_indexs)
         return matrix_embeddings,label_indexs
 
 train_ids = torch.tensor([item.cpu().detach().numpy() for item in train_ids]).squeeze()
@@ -195,14 +187,15 @@ valid_data = TensorDataset(dev_ids, dev_masks,dev_token_type_ids,dev_tags)
 valid_sampler = RandomSampler(valid_data)
 valid_dataloader = DataLoader(valid_data, sampler=valid_sampler, batch_size=bs)
 
+pretrain_path = './save_models/model_10_0.9411764705882353.pth'
 fewshot = FewShot_NER(base_path,tag2id,bs,tag_file)
-
+fewshot.load_state_dict(torch.load(pretrain_path),strict = False)
 optimizer = torch.optim.Adam(fewshot.parameters(),
                   lr = 5e-5 # default is 5e-5
                   # eps = 1e-8 # default is 1e-8
                 )
 
-epochs = 200
+epochs = 100
 total_steps = len(train_dataloader) * epochs
 scheduler = get_linear_schedule_with_warmup(optimizer,
                                            num_warmup_steps = 0,
@@ -278,16 +271,19 @@ def define_loss_function(input,target):
     return nlloss_output
 
 tra_loss,steps = 0.0,0
+
+scaler = torch.cuda.amp.GradScaler()
 for i in range(epochs):
     fewshot.train()
     for step ,batch in enumerate(train_dataloader):
         input_ids,masks,token_type_ids,labels= (i.to(device) for i in batch)
+
         matrix_embeddings,label_indexs = fewshot({"input_ids":input_ids,"attention_mask":masks,"token_type_ids":token_type_ids})
-        # print(outputs.float().dtype,labels.float().dtype)
+            # print(outputs.float().dtype,labels.float().dtype)
         loss = loss_function(matrix_embeddings.view(-1, len(tag2id)),labels.view(-1)) # CrossEntropyLoss
-
+        optimizer.zero_grad()
         loss.backward()
-
+        
         tra_loss += loss
         steps += 1
 
@@ -304,11 +300,11 @@ for i in range(epochs):
     dev_loss = 0.0
     predictions , true_labels = [], []
 
-    for batch in valid_dataloader:
+    for batch in tqdm(valid_dataloader):
         input_ids,masks,token_type_ids,labels= (i.to(device) for i in batch)
 
         with torch.no_grad():
-            matrix_embeddings,output_indexs = fewshot({"input_ids":input_ids,"attention_mask":masks,"token_type_ids":token_type_ids})
+            matrix_embeddings,output_indexs = fewshot({"input_ids":input_ids,"attention_mask":masks,"token_type_ids":token_type_ids},flag = False)
 
         # scores = scores.detach().cpu().numpy()
         predictions.extend(output_indexs.detach().cpu().numpy().tolist())
@@ -320,31 +316,31 @@ for i in range(epochs):
 
     if F1_score < f1:
         F1_score = f1
-        torch.save(fewshot.state_dict(), 'save_models/model_{}_{}.pth'.format(i,F1_score))
+        torch.save(fewshot.state_dict(), './fewshot/20/model_{}_{}.pth'.format(i,F1_score))
 
-test_tokens,test_labels = load_data(base,test_path)
-test_ids,test_token_type_ids,test_attention_masks,test_tags,test_lengths = gen_features(test_tokens,test_labels,tokenizer,tag2id,max_len)
-
-test_ids = torch.tensor([item.cpu().detach().numpy() for item in test_ids]).squeeze()
-test_tags = torch.tensor(test_tags)
-test_masks = torch.tensor([item.cpu().detach().numpy() for item in test_attention_masks]).squeeze()
-test_token_type_ids = torch.tensor([item.cpu().detach().numpy() for item in test_token_type_ids]).squeeze()
-
-test_data = TensorDataset(test_ids, test_masks,test_token_type_ids, test_tags)
-# test_sampler = RandomSampler(test_data)
-test_dataloader = DataLoader(test_data, batch_size=bs)
-
-fewshot.eval()
-test_pre,test_true = [],[]
-for batch in test_dataloader:
-
-    input_ids,masks,token_type_ids,labels= (i.to(device) for i in batch)
-
-    with torch.no_grad():
-        matrix_embeddings,output_indexs = fewshot({"input_ids":input_ids,"attention_mask":masks,"token_type_ids":token_type_ids})
-
-    test_pre.extend(output_indexs.detach().cpu().numpy().tolist())
-    test_true.extend(labels.to('cpu').numpy().tolist())
-test_f1, test_precision, test_recall = measure(test_pre,test_true,test_lengths,id2tag)
-print('Test Acc : {},Recall : {},F1 :{}'.format(test_precision,test_recall,test_f1))
-
+#test_tokens,test_labels = load_data(base,test_path)
+#test_ids,test_token_type_ids,test_attention_masks,test_tags,test_lengths = gen_features(test_tokens,test_labels,tokenizer,tag2id,max_len)
+#
+#test_ids = torch.tensor([item.cpu().detach().numpy() for item in test_ids]).squeeze()
+#test_tags = torch.tensor(test_tags)
+#test_masks = torch.tensor([item.cpu().detach().numpy() for item in test_attention_masks]).squeeze()
+#test_token_type_ids = torch.tensor([item.cpu().detach().numpy() for item in test_token_type_ids]).squeeze()
+#
+#test_data = TensorDataset(test_ids, test_masks,test_token_type_ids, test_tags)
+## test_sampler = RandomSampler(test_data)
+#test_dataloader = DataLoader(test_data, batch_size=bs)
+#
+#fewshot.eval()
+#test_pre,test_true = [],[]
+#for batch in test_dataloader:
+#
+#    input_ids,masks,token_type_ids,labels= (i.to(device) for i in batch)
+#
+#    with torch.no_grad():
+#        matrix_embeddings,output_indexs = fewshot({"input_ids":input_ids,"attention_mask":masks,"token_type_ids":token_type_ids},flag = False)
+#
+#    test_pre.extend(output_indexs.detach().cpu().numpy().tolist())
+#    test_true.extend(labels.to('cpu').numpy().tolist())
+#test_f1, test_precision, test_recall = measure(test_pre,test_true,test_lengths,id2tag)
+#print('Test Acc : {},Recall : {},F1 :{}'.format(test_precision,test_recall,test_f1))
+#

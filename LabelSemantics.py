@@ -5,6 +5,11 @@ import os
 import copy
 import pandas as pd
 import torch.nn as nn
+from torch.autograd import Variable
+import torch.optim as optim
+from torch.utils.data import TensorDataset
+from torch.utils.data import DataLoader
+import torch.nn.functional as F
 from transformers import AdamW, get_linear_schedule_with_warmup
 from transformers import BertTokenizer,BertConfig,BertForTokenClassification,BertModel,AlbertModel,AlbertTokenizer
 import time,datetime
@@ -18,11 +23,11 @@ from sklearn.preprocessing import MultiLabelBinarizer
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
 from sklearn import metrics
 
-base = './ResumeNER'
+base = '/root/workspace/FewShotNER/dataset-fewshot/msra'
 base_path = '/root/workspace/berts/chinese-roberta-wwm-ext'
-train_path = 'train.char.bmes'
-dev_path = 'dev.char.bmes'
-test_path = 'test.char.bmes'
+train_path = 'train.txt'
+dev_path = 'dev.txt'
+test_path = 'test.txt'
 
 def load_data(base,train_path):
     full = os.path.join(base,train_path)
@@ -50,7 +55,7 @@ def trans2id(label_file):
 
     tag_set = []
     for line in short_labels:
-        prefix = ['B-','M-','E-','S-']
+        prefix = ['B-','I-']
         tag_set += [pre+line for pre in prefix]
     tag_set.append('O')
 
@@ -82,10 +87,10 @@ def gen_features(tokens,labels,tokenizer,tag2id,max_len):
     return input_ids,token_type_ids,attention_masks,tags,lengths
 
 max_len = 128
-bs = 32
+bs = 64
 tokenizer = BertTokenizer.from_pretrained(base_path)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-tag_file = 'tags.json'
+tag_file = 'pretrain.json'
 
 train_tokens,train_labels = load_data(base,train_path)
 tag2id,id2tag,short_labels = trans2id(tag_file)
@@ -99,16 +104,16 @@ class FewShot_NER(nn.Module):
         super().__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.token_encoder = BertModel.from_pretrained(base_model_path).to(self.device)
-        # self.label_encoder = BertModel.from_pretrained(base_model_path).to(self.device)
+        self.label_encoder = BertModel.from_pretrained(base_model_path).to(self.device)
         self.label_context = self.__read_file(tag_file)
         self.index_context = {
             "B":"开始词",
-            "M":"中间词",
+            "I":"中间词",
             "E":"结束词",
             "S":"单字词"
         }
         self.tokenizer = BertTokenizer.from_pretrained(base_path)
-        # self.label_representation = self.build_label_representation(tag2id).to(self.device)
+        #self.label_representation = self.build_label_representation(tag2id).to(self.device)
         self.batch_size = batch_size
         self.tag2id = tag2id
 
@@ -136,7 +141,7 @@ class FewShot_NER(nn.Module):
         tag_embeddings = []
         for label in labels:
             input_ids = tokenizer.encode_plus(label,return_tensors='pt',padding='max_length',max_length=tag_max_len)
-            outputs = self.token_encoder(input_ids=input_ids['input_ids'].to(self.device),
+            outputs = self.label_encoder(input_ids=input_ids['input_ids'].to(self.device),
                                          token_type_ids=input_ids['token_type_ids'].to(self.device),attention_mask = input_ids['attention_mask'].to(self.device))
             pooler_output = outputs.pooler_output
             tag_embeddings.append(pooler_output)
@@ -147,27 +152,26 @@ class FewShot_NER(nn.Module):
     def forward(self,inputs,flag = True):
         if flag:
             label_representation = self.build_label_representation(self.tag2id).to(self.device)
+            self.label_representation = label_representation.detach()
         else:
             label_representation = self.label_representation
         outputs = self.token_encoder(input_ids=inputs['input_ids'],
                                      token_type_ids=inputs['token_type_ids'],attention_mask = inputs['attention_mask'])
         token_embeddings = outputs.last_hidden_state
-        tag_lens,hidden_size = label_representation.shape
+        tag_lens,hidden_size = self.label_representation.shape
         current_batch_size  = token_embeddings.shape[0]
-        label_embedding = label_representation.expand(current_batch_size,tag_lens,hidden_size)
+        label_embedding = self.label_representation.expand(current_batch_size,tag_lens,hidden_size)
         label_embeddings = label_embedding.transpose(2,1)
         matrix_embeddings = torch.matmul(token_embeddings,label_embeddings)
         softmax_embedding= nn.Softmax(dim=-1)(matrix_embeddings)
         label_indexs = torch.argmax(softmax_embedding,dim=-1)
-        if flag:
-            self.label_representation = label_representation
         return matrix_embeddings,label_indexs
 
 train_ids = torch.tensor([item.cpu().detach().numpy() for item in train_ids]).squeeze()
 train_tags = torch.tensor(train_tags)
 train_masks = torch.tensor([item.cpu().detach().numpy() for item in train_attention_masks]).squeeze()
 train_token_type_ids = torch.tensor([item.cpu().detach().numpy() for item in train_token_type_ids]).squeeze()
-print(train_ids.shape,train_tags.shape,train_masks.shape,train_token_type_ids.shape)
+# print(train_ids.shape,train_tags.shape,train_masks.shape,train_token_type_ids.shape)
 
 dev_ids = torch.tensor([item.cpu().detach().numpy() for item in dev_ids]).squeeze()
 dev_tags = torch.tensor(dev_tags)
@@ -183,22 +187,13 @@ valid_sampler = RandomSampler(valid_data)
 valid_dataloader = DataLoader(valid_data, sampler=valid_sampler, batch_size=bs)
 
 fewshot = FewShot_NER(base_path,tag2id,bs,tag_file)
-```
-根据paper，基本的Pipelines的流程是先在source dataset上pre-finetuning，然后在source dataset上面finetune.
-
-两个步骤的区别就在这下面两行代码。在target dataset上面finetune的时候，只需要加载pre-finetuning训练好的模型作为base model就行了。
-
-pre-finetuning的时候注释掉着两行就好了
-```
-pretrain_path = ''
-fewshot.load_state_dict(torch.load(pretrain_path),strict = True)
 
 optimizer = torch.optim.Adam(fewshot.parameters(),
                   lr = 1e-5 # default is 5e-5
                   # eps = 1e-8 # default is 1e-8
                 )
 
-epochs = 200
+epochs = 100
 total_steps = len(train_dataloader) * epochs
 scheduler = get_linear_schedule_with_warmup(optimizer,
                                            num_warmup_steps = 0,
@@ -282,9 +277,11 @@ for i in range(epochs):
         input_ids,masks,token_type_ids,labels= (i.to(device) for i in batch)
 
         matrix_embeddings,label_indexs = fewshot({"input_ids":input_ids,"attention_mask":masks,"token_type_ids":token_type_ids})
+            # print(outputs.float().dtype,labels.float().dtype)
         loss = loss_function(matrix_embeddings.view(-1, len(tag2id)),labels.view(-1)) # CrossEntropyLoss
+        optimizer.zero_grad()
         loss.backward()
-
+        
         tra_loss += loss
         steps += 1
 

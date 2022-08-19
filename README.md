@@ -4,6 +4,8 @@
 经过修改，现在的方案已与原paper中思路一样，采用两个独立Bert Encoder分别对token和label进行编码
 
 
+> 关于数据集，内部数据不可共享。建议使用resume以及其他开源数据做个简单实验
+
 ## 代码结构如下
 ```
 ├── fewshot.json

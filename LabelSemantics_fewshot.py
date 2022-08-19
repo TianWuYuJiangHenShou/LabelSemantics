@@ -23,7 +23,7 @@ from sklearn.preprocessing import MultiLabelBinarizer
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
 from sklearn import metrics
 
-base = '/root/workspace/FewShotNER/dataset-fewshot/transwarp-finance'
+base = '/root/workspace/FewShotNER/dataset-fewshot/finance'
 base_path = '/root/workspace/berts/chinese-roberta-wwm-ext'
 train_path = '20-shot-train.txt'
 dev_path = 'test.txt'
